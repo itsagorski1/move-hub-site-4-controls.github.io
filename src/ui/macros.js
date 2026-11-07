@@ -1,0 +1,430 @@
+// The Macros tab: an editor over named slots in localStorage, and the
+// controls to run one against hub.macro.
+//
+// See docs/superpowers/specs/2026-07-28-macro-system-design.md
+
+import { $ } from './dom.js';
+import { initMacroHelp } from './macro-help.js';
+import { EXAMPLES } from '../macro/api-docs.js';
+import { createMacroStore } from '../macro/store.js';
+import { SOURCE_LINE_OFFSET } from '../macro/rpc.js';
+import { rideToMacro, DEFAULT_EPSILON } from '../macro/ride-to-macro.js';
+import { createHighlighter } from './code-editor.js';
+
+const AUTOSAVE_DEBOUNCE_MS = 400;
+const ELAPSED_TICK_MS = 100;
+// Marks an option as one of the shipped samples rather than a stored slot.
+const SAMPLE_PREFIX = 'sample:';
+
+const formatElapsed = (ms) => (ms / 1000).toFixed(1) + 's';
+
+// A runtime error's stack carries a frame in the eval'd source, reported as
+// "<anonymous>:LINE:COL". A host-side refusal (unsafe, bad duration, …) is
+// constructed away from that frame and carries no such line.
+function lineFromStack(stack) {
+  const m = /<anonymous>:(\d+):\d+/.exec(stack ?? '');
+  if (!m) return null;
+  const line = Number(m[1]) - SOURCE_LINE_OFFSET;
+  return line > 0 ? line : null;
+}
+
+function formatFailure(detail) {
+  const message = detail?.message ?? detail?.name ?? 'unknown error';
+  const line = lineFromStack(detail?.stack);
+  return line ? `error at line ${line}: ${message}` : `error: ${message}`;
+}
+
+// Only a clean finish reads as plain `idle`; anything else names what ended
+// the run — a collision, a dying link, a disconnect. The host appends
+// ` — drive mode left as …` to either form when the run changed the mode.
+function formatEnd(reason) {
+  if (!reason || reason === 'finished') return 'idle';
+  const text = String(reason);
+  if (text.startsWith('finished —')) return `idle${text.slice('finished'.length)}`;
+  return `stopped: ${text}`;
+}
+
+export function initMacroPanel(hub) {
+  const select = $('macro-select');
+  const newBtn = $('macro-new');
+  const deleteBtn = $('macro-delete');
+  const source = $('macro-source');
+  const paint = $('macro-paint');
+  const runBtn = $('macro-run');
+  const stopBtn = $('macro-stop');
+  const unsafeBox = $('macro-unsafe');
+  const elapsedOut = $('macro-elapsed');
+  const statusEl = $('macro-status');
+  const exportBtn = $('macro-export');
+  const importBtn = $('macro-import');
+  const importFile = $('macro-import-file');
+  const recordBtn = $('macro-record');
+  const epsilonInput = $('macro-epsilon');
+  const epsilonOut = $('macro-epsilon-out');
+  const noteEl = $('macro-record-note');
+
+  // The grammar is 27 KB and the landing page is served no-store, so it is
+  // fetched the first time someone puts a caret in the editor and never before.
+  // See docs/DESIGN-NOTES.md § The editor is a textarea with a painted shadow
+  let highlighter = null;
+  let arming = false;
+  async function armHighlighter() {
+    if (highlighter || arming) return;
+    arming = true;
+    try {
+      const [core, grammar] = await Promise.all([
+        import('../../assets/hljs/core.min.js'),
+        import('../../assets/hljs/javascript.min.js'),
+      ]);
+      const hljs = core.default;
+      hljs.registerLanguage('javascript', grammar.default);
+      highlighter = createHighlighter({
+        textarea: source,
+        output: paint,
+        highlight: (code) => hljs.highlight(code, { language: 'javascript' }).value,
+      });
+      highlighter.attach();
+      highlighter.paint();
+    } catch {
+      // No highlighting, no problem: the textarea keeps its own colour.
+    }
+  }
+  source.addEventListener('focus', armHighlighter, { once: true });
+
+  const store = createMacroStore(localStorage);
+
+  // One writer for the status line: the tone is a class, and a later plain
+  // message has to clear it or a fixed error stays red forever.
+  const setStatus = (text, tone) => {
+    statusEl.textContent = text;
+    statusEl.classList.toggle('macro-bad', tone === 'bad');
+    statusEl.classList.toggle('macro-live', tone === 'live');
+  };
+
+  let currentId = null;
+  let autosaveTimer = 0;
+  let running = false;
+  let startedAt = 0;
+  let lastResult = null; // the last run's formatted result, read by the following 'idle'
+
+  let recording = false;
+  let ride = null;        // the raw ride, this session only — never written to storage
+  let recorded = null;    // the emitted slot, held here until it is saved once
+  let recordedSaved = false;
+
+  const isConnected = () => hub.connected ?? hub.transport?.connected ?? false;
+
+  function paintButtons() {
+    runBtn.disabled = !hub.macro || running || recording;
+    stopBtn.disabled = !running;
+    deleteBtn.disabled = !currentId || recording;
+    recordBtn.disabled = !hub.recorder || !isConnected() || running;
+    recordBtn.textContent = recording ? 'Stop recording' : 'Record';
+    newBtn.disabled = recording;
+    importBtn.disabled = recording;
+    select.disabled = recording;
+  }
+
+  function currentMacro() {
+    const stored = store.list().find((m) => m.id === currentId);
+    if (stored) return stored;
+    return recorded && recorded.id === currentId ? recorded : null;
+  }
+
+  const option = (value, label) => {
+    const opt = document.createElement('option');
+    opt.value = value;
+    opt.textContent = label;
+    return opt;
+  };
+
+  // Saved slots and the shipped samples in one control. The samples used to be
+  // a row of buttons in a panel of their own, which put the two ways of opening
+  // a macro on opposite sides of the screen.
+  // See docs/DESIGN-NOTES.md § The macro palette is grouped, and sits beside the editor
+  function renderSelect() {
+    const stored = [...store.list()];
+    const macros = (recorded && !stored.some((m) => m.id === recorded.id)
+      ? [...stored, recorded]
+      : stored).sort((a, b) => a.name.localeCompare(b.name));
+    select.replaceChildren();
+    if (!macros.length) {
+      select.append(option('', 'no macros yet — New, or copy a sample'));
+    } else {
+      const saved = document.createElement('optgroup');
+      saved.label = 'saved';
+      for (const m of macros) saved.append(option(m.id, m.name));
+      select.append(saved);
+    }
+    const samples = document.createElement('optgroup');
+    samples.label = 'samples — opening one saves a copy';
+    for (const e of EXAMPLES) samples.append(option(`${SAMPLE_PREFIX}${e.name}`, e.name));
+    select.append(samples);
+
+    if (currentId && macros.some((m) => m.id === currentId)) select.value = currentId;
+    else currentId = macros[0]?.id ?? null;
+    select.value = currentId ?? '';
+  }
+
+  // Opening a sample twice must not overwrite the copy that was edited the
+  // first time, and must not silently pick the old one either.
+  function uniqueName(base) {
+    const taken = new Set(store.list().map((m) => m.name));
+    if (!taken.has(base)) return base;
+    for (let n = 2; ; n++) if (!taken.has(`${base} ${n}`)) return `${base} ${n}`;
+  }
+
+  function copySample(name) {
+    const sample = EXAMPLES.find((e) => e.name === name);
+    if (!sample) { renderSelect(); return; }
+    try {
+      const saved = store.save({
+        name: uniqueName(sample.name), source: sample.source,
+        allowUnsafe: false, updatedAt: Date.now(),
+      });
+      currentId = saved.id;
+      renderSelect();
+      loadCurrent();
+      setStatus(`copied the ${sample.name} sample`);
+    } catch (err) {
+      renderSelect();
+      setStatus(`could not save: ${err.message}`, 'bad');
+    }
+  }
+
+  let help = null;
+
+  function loadCurrent() {
+    const m = currentMacro();
+    source.value = m?.source ?? '';
+    highlighter?.paint();
+    // Reflects store.js's stored flag; an import already forces it to false
+    // regardless of the file's claim.
+    unsafeBox.checked = m?.allowUnsafe === true;
+    paintButtons();
+    help?.render();   // the checkbox moved without firing `change`
+  }
+
+  // store.save() throws when localStorage is full; this origin's quota is
+  // shared with the gamepad mapping. Autosave runs from a debounce timer and
+  // from every path that switches slots, so the refusal is caught here rather
+  // than at each of those call sites — one of them used to let it escape a
+  // click handler and the rest let it die in a timer, unseen.
+  function persist(manual = false) {
+    if (!currentId) return;
+    if (recorded && currentId === recorded.id && !recordedSaved) {
+      if (!manual) return;
+      recordedSaved = true;
+    }
+    const existing = currentMacro();
+    try {
+      store.save({
+        id: currentId,
+        name: existing?.name ?? 'untitled',
+        source: source.value,
+        allowUnsafe: unsafeBox.checked,
+        updatedAt: Date.now(),
+      });
+    } catch (err) {
+      setStatus(`could not save: ${err.message}`, 'bad');
+    }
+  }
+
+  function scheduleAutosave() {
+    if (autosaveTimer) clearTimeout(autosaveTimer);
+    autosaveTimer = setTimeout(() => { autosaveTimer = 0; persist(); }, AUTOSAVE_DEBOUNCE_MS);
+  }
+
+  // Anything that changes which slot the editor shows writes the pending edit
+  // out first: the debounced timer would otherwise fire against the new slot.
+  function flushAutosave() {
+    if (!autosaveTimer) return;
+    clearTimeout(autosaveTimer);
+    autosaveTimer = 0;
+    persist();
+  }
+
+  select.addEventListener('change', () => {
+    flushAutosave();
+    const picked = select.value;
+    if (picked.startsWith(SAMPLE_PREFIX)) { copySample(picked.slice(SAMPLE_PREFIX.length)); return; }
+    currentId = picked || null;
+    loadCurrent();
+  });
+
+  newBtn.addEventListener('click', () => {
+    flushAutosave();
+    const saved = store.save({
+      name: `macro ${store.list().length + 1}`, source: '', allowUnsafe: false, updatedAt: Date.now(),
+    });
+    currentId = saved.id;
+    renderSelect();
+    loadCurrent();
+  });
+
+  deleteBtn.addEventListener('click', () => {
+    if (!currentId) return;
+    store.remove(currentId);
+    currentId = null;
+    renderSelect();
+    loadCurrent();
+  });
+
+  source.addEventListener('input', scheduleAutosave);
+  unsafeBox.addEventListener('change', () => persist(true));
+
+  runBtn.addEventListener('click', () => {
+    if (!hub.macro) return;
+    flushAutosave();
+    persist(true);
+    lastResult = null;
+    setStatus('starting…', 'live');
+    // run() rejects on "already running" and on anything spawnWorker throws —
+    // a blocked module worker, a CSP failure.
+    hub.macro.run(source.value, { allowUnsafe: unsafeBox.checked })
+      .catch((err) => setStatus(`error: ${err?.message ?? err}`, 'bad'));
+  });
+
+  // The reason is rendered as `stopped: …`, so it reads as the cause, not a sentence.
+  stopBtn.addEventListener('click', () => { hub.macro?.abort('by the Stop button'); });
+
+  const showNote = (text) => { noteEl.textContent = text ?? ''; noteEl.hidden = !text; };
+
+  const tolerance = () => {
+    const n = Number(epsilonInput.value);
+    return Number.isFinite(n) && n > 0 ? Math.round(n) : DEFAULT_EPSILON.speed;
+  };
+
+  // The ride lands in a slot of its own.
+  // See docs/DESIGN-NOTES.md § A recording lands in a slot of its own
+  function emit() {
+    if (!ride) return;
+    const n = tolerance();
+    const { source: text, warnings } = rideToMacro(ride, { epsilon: { speed: n, steer: n } });
+    if (!recorded || currentId !== recorded.id) {
+      flushAutosave();
+      recorded = {
+        id: 'rec' + Date.now().toString(36),
+        name: uniqueName('recording'), source: text, allowUnsafe: false, updatedAt: Date.now(),
+      };
+      recordedSaved = false;
+      currentId = recorded.id;
+      renderSelect();
+    } else {
+      recorded.source = text;
+      recorded.updatedAt = Date.now();
+    }
+    source.value = text;
+    highlighter?.paint();
+    unsafeBox.checked = false;
+    paintButtons();
+    help?.render();
+    setStatus(warnings.length ? `recorded — ${warnings[0]}` : `recorded into ${recorded.name}`);
+  }
+
+  function startRecording() {
+    if (recording || !hub.recorder) return;
+    flushAutosave();
+    if (recordedSaved) { recorded = null; recordedSaved = false; }
+    ride = null;
+    showNote('');
+    hub.recorder.start();
+    recording = true;
+    paintButtons();
+    setStatus('recording — drive the car', 'live');
+  }
+
+  // Task 4 calls this from the composition root for every ending the panel
+  // cannot see: a collision, a disconnect, a blur, a mode switch.
+  function stopRecording(reason = 'user') {
+    if (!recording) return;
+    recording = false;
+    const taken = hub.recorder?.stop(reason) ?? null;
+    paintButtons();
+    if (!taken || !taken.frames?.length) {
+      showNote('nothing was recorded — the car never moved');
+      setStatus(`recording ended: ${reason}`);
+      return;
+    }
+    ride = taken;
+    recorded = null;
+    recordedSaved = false;
+    showNote('');
+    emit();
+  }
+
+  recordBtn.addEventListener('click', () => {
+    if (recording) stopRecording('user');
+    else startRecording();
+  });
+
+  epsilonInput.addEventListener('input', () => {
+    epsilonOut.textContent = String(tolerance());
+    if (ride) emit();
+  });
+
+  exportBtn.addEventListener('click', () => {
+    const blob = new Blob([store.exportAll()], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const a = document.createElement('a');
+    a.href = url;
+    a.download = 'lego-macros.json';
+    a.click();
+    URL.revokeObjectURL(url);
+  });
+
+  importBtn.addEventListener('click', () => importFile.click());
+  importFile.addEventListener('change', async () => {
+    const file = importFile.files?.[0];
+    importFile.value = '';
+    if (!file) return;
+    flushAutosave();
+    try {
+      const incoming = store.importFrom(await file.text());
+      if (incoming.length) currentId = incoming[0].id;
+      renderSelect();
+      loadCurrent();
+      setStatus(`imported ${incoming.length} macro(s)`);
+    } catch (err) {
+      setStatus(`import failed: ${err.message}`, 'bad');
+    }
+  });
+
+  // One persistent tick, matching initTelemetryPanel's queue-depth interval;
+  // a no-op while no run is live.
+  setInterval(() => { if (running) showElapsed(Date.now() - startedAt); }, ELAPSED_TICK_MS);
+
+  function showElapsed(ms) { elapsedOut.textContent = formatElapsed(ms); }
+
+  // A macro's own print() output — the status line's other tenant, alongside
+  // the run-state text showState writes.
+  function showPrint(args) { setStatus(args.map(String).join(' '), 'live'); }
+
+  // The host's word on what a call is doing mid-run — an arming switch. Shares
+  // the status line with showPrint and showState; the run stays `running`.
+  function showNotice(text) { setStatus(text, 'live'); }
+
+  function showState(state, detail) {
+    running = state === 'arming' || state === 'running' || state === 'stopping';
+    paintButtons();
+
+    if (state === 'arming') { lastResult = null; startedAt = Date.now(); showElapsed(0); }
+    if (state === 'running') setStatus('running', 'live');
+    if (state === 'stopping') setStatus('stopping…', 'live');
+    if (state === 'failed') lastResult = formatFailure(detail);
+    if (state === 'idle') setStatus(lastResult ?? formatEnd(detail), lastResult ? 'bad' : undefined);
+  }
+
+  renderSelect();
+  loadCurrent();
+  showNote('');
+  epsilonOut.textContent = String(tolerance());
+  paintButtons();
+
+  // store.save() throws when localStorage is full; this origin's quota is
+  // shared with the gamepad mapping.
+  help = initMacroHelp({ source, unsafeBox, onInsert: scheduleAutosave });
+  help.render();
+
+  return { showState, showElapsed, showPrint, showNotice, stopRecording };
+}
